@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+# VM management functions
+
+ensure_vm_exists() {
+    # Check if VM exists
+    if gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" &>/dev/null; then
+        echo "  VM already exists: ${VM_NAME}"
+        
+        # Ensure disk is attached
+        if ! gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+            --format="value(disks[].source)" | grep -q "$DISK_NAME"; then
+            echo "  Attaching disk to existing VM..."
+            gcloud compute instances attach-disk "$VM_NAME" \
+                --disk="$DISK_NAME" \
+                --zone="$ZONE" \
+                --project="$GCP_PROJECT" \
+                --quiet
+        fi
+        
+        # Ensure SSH keys are added
+        ensure_ssh_keys
+        
+        # Ensure startup script is up to date
+        ensure_startup_script
+        
+        # Check if dependencies are installed, offer to install if not
+        check_and_install_dependencies
+        
+        return 0
+    fi
+
+    echo "  Creating VM: ${VM_NAME} (${MACHINE_TYPE}, ${ZONE})"
+    
+    # Determine boot disk type based on machine type
+    # c3 and c4 machine types require pd-ssd or pd-balanced
+    # Other machine types can use pd-standard
+    if [[ "$MACHINE_TYPE" =~ ^c[34]- ]]; then
+        BOOT_DISK_TYPE="pd-balanced"
+    else
+        BOOT_DISK_TYPE="pd-standard"
+    fi
+    
+    # Create startup script
+    STARTUP_SCRIPT=$(create_startup_script)
+    
+    # Get SSH public key to add to VM metadata
+    SSH_KEY_FILE="${HOME}/.ssh/google_compute_engine.pub"
+    if [[ ! -f "$SSH_KEY_FILE" ]]; then
+        # Generate key if it doesn't exist
+        echo "  Generating SSH key..."
+        ssh-keygen -t rsa -f "${HOME}/.ssh/google_compute_engine" -C "$(whoami)" -N "" -q
+    fi
+    
+    # Format SSH key for metadata (username:publickey)
+    SSH_USER=$(whoami)
+    SSH_PUBLIC_KEY=$(cat "$SSH_KEY_FILE")
+    SSH_KEYS_METADATA="${SSH_USER}:${SSH_PUBLIC_KEY}"
+    
+    # Create VM with external IP for internet access (still using IAP for SSH)
+    # The external IP is needed for outbound internet access (apt-get, Docker downloads, etc.)
+    gcloud compute instances create "$VM_NAME" \
+        --machine-type="$MACHINE_TYPE" \
+        --zone="$ZONE" \
+        --image-family="ubuntu-2204-lts" \
+        --image-project="ubuntu-os-cloud" \
+        --boot-disk-size=10GB \
+        --boot-disk-type="$BOOT_DISK_TYPE" \
+        --disk="name=${DISK_NAME},device-name=devbox-disk,mode=rw" \
+        --metadata-from-file="startup-script=${STARTUP_SCRIPT}" \
+        --metadata="ssh-keys=${SSH_KEYS_METADATA}" \
+        --tags="devbox" \
+        --project="$GCP_PROJECT" \
+        --quiet
+
+    if [[ $? -eq 0 ]]; then
+        echo "  ✓ VM created successfully"
+        echo "  ⏳ Waiting for VM to be ready (this may take a few minutes)..."
+        wait_for_vm_ready
+        return 0
+    else
+        echo "  ❌ Failed to create VM"
+        return 1
+    fi
+}
+
+create_startup_script() {
+    local script_file=$(mktemp)
+    cat > "$script_file" <<'EOF'
+#!/bin/bash
+# Log all output to a file for debugging
+exec > >(tee -a /var/log/devbox-startup.log) 2>&1
+
+echo "=== Devbox Startup Script Started ==="
+date
+
+# Helper function to wait for network connectivity
+wait_for_network() {
+    max_attempts=30
+    attempt=0
+    echo "Waiting for network connectivity..."
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
+            echo "Network connectivity confirmed"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        echo "Waiting for network... ($attempt/$max_attempts)"
+        sleep 2
+    done
+    
+    echo "Warning: Network connectivity check timed out, but continuing..."
+    return 0
+}
+
+# Helper function to retry a command
+retry_command() {
+    max_attempts=3
+    attempt=0
+    command="$@"
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if $command; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [ $attempt -lt $max_attempts ]; then
+            echo "Command failed, retrying... ($attempt/$max_attempts)"
+            sleep 5
+        fi
+    done
+    
+    echo "Command failed after $max_attempts attempts: $command"
+    return 1
+}
+
+# Mount persistent disk
+DISK_DEVICE="/dev/disk/by-id/google-devbox-disk"
+MOUNT_POINT="/mnt/dev"
+
+echo "Setting up persistent disk..."
+# Wait for disk to be available
+disk_wait_attempts=0
+while [ ! -e "$DISK_DEVICE" ] && [ $disk_wait_attempts -lt 60 ]; do
+    echo "Waiting for disk $DISK_DEVICE... ($disk_wait_attempts/60)"
+    sleep 2
+    disk_wait_attempts=$((disk_wait_attempts + 1))
+done
+
+if [ ! -e "$DISK_DEVICE" ]; then
+    echo "ERROR: Disk $DISK_DEVICE not found after waiting"
+    exit 1
+fi
+
+# Check if disk is already mounted
+if ! mountpoint -q "$MOUNT_POINT"; then
+    echo "Mounting persistent disk..."
+    # Create mount point
+    mkdir -p "$MOUNT_POINT"
+    
+    # Format disk if not already formatted
+    if ! blkid "$DISK_DEVICE" > /dev/null 2>&1; then
+        echo "Formatting disk..."
+        mkfs.ext4 -F "$DISK_DEVICE" || {
+            echo "ERROR: Failed to format disk"
+            exit 1
+        }
+    fi
+    
+    # Mount disk
+    mount "$DISK_DEVICE" "$MOUNT_POINT" || {
+        echo "ERROR: Failed to mount disk"
+        exit 1
+    }
+    
+    # Add to fstab if not already present
+    if ! grep -q "$DISK_DEVICE.*$MOUNT_POINT" /etc/fstab; then
+        echo "$DISK_DEVICE $MOUNT_POINT ext4 defaults 0 2" >> /etc/fstab
+    fi
+    
+    # Set permissions - ownership will be fixed when user first connects
+    # Make it writable so the first user can fix ownership
+    chmod 777 "$MOUNT_POINT"
+    echo "Persistent disk mounted (permissions will be fixed on first connection)"
+    echo "Persistent disk mounted successfully"
+else
+    echo "Persistent disk already mounted"
+fi
+
+# Wait for network before installing packages
+wait_for_network
+
+# Install Docker if not present
+if ! command -v docker &> /dev/null; then
+    echo "Installing Docker..."
+    
+    # Update package lists with retry
+    retry_command apt-get update -qq || {
+        echo "WARNING: apt-get update failed, but continuing..."
+    }
+    
+    # Install prerequisites
+    retry_command apt-get install -y ca-certificates curl gnupg lsb-release || {
+        echo "ERROR: Failed to install prerequisites"
+        exit 1
+    }
+    
+    # Set up Docker repository
+    install -m 0755 -d /etc/apt/keyrings || {
+        echo "ERROR: Failed to create keyrings directory"
+        exit 1
+    }
+    
+    # Download Docker GPG key with retry
+    retry_command curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg || {
+        echo "ERROR: Failed to download Docker GPG key"
+        exit 1
+    }
+    
+    gpg --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg || {
+        echo "ERROR: Failed to process Docker GPG key"
+        exit 1
+    }
+    
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    
+    # Add Docker repository
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Update package lists again
+    retry_command apt-get update -qq || {
+        echo "ERROR: Failed to update package lists after adding Docker repo"
+        exit 1
+    }
+    
+    # Install Docker packages
+    retry_command apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || {
+        echo "ERROR: Failed to install Docker packages"
+        exit 1
+    }
+    
+    # Enable and start Docker
+    systemctl enable docker || {
+        echo "WARNING: Failed to enable Docker service"
+    }
+    
+    systemctl start docker || {
+        echo "WARNING: Failed to start Docker service"
+    }
+    
+    # Verify Docker is working
+    if docker --version > /dev/null 2>&1; then
+        echo "Docker installed successfully: $(docker --version)"
+    else
+        echo "WARNING: Docker installed but version check failed"
+    fi
+else
+    echo "Docker already installed: $(docker --version)"
+fi
+
+# Install Git if not present
+if ! command -v git &> /dev/null; then
+    echo "Installing Git..."
+    retry_command apt-get update -qq || {
+        echo "WARNING: apt-get update failed for Git installation"
+    }
+    retry_command apt-get install -y git || {
+        echo "ERROR: Failed to install Git"
+        exit 1
+    }
+    echo "Git installed successfully: $(git --version)"
+else
+    echo "Git already installed: $(git --version)"
+fi
+
+# Install idle shutdown service
+cat > /usr/local/bin/devbox-idle-shutdown.sh <<'IDLESCRIPT'
+#!/bin/bash
+IDLE_TIMEOUT_MINUTES=10
+IDLE_TIMEOUT_SECONDS=$((IDLE_TIMEOUT_MINUTES * 60))
+TIMESTAMP_FILE="/tmp/devbox-last-ssh-activity"
+
+# Update timestamp
+update_timestamp() {
+    echo $(date +%s) > "$TIMESTAMP_FILE"
+}
+
+# Initialize
+update_timestamp
+
+while true; do
+    # Check for active SSH sessions (pts/* are SSH pseudo-terminals)
+    ACTIVE_SESSIONS=$(who | grep -c "pts/" || echo "0")
+    
+    if [ "$ACTIVE_SESSIONS" -eq 0 ]; then
+        # No active sessions, check idle time
+        if [ -f "$TIMESTAMP_FILE" ]; then
+            LAST_ACTIVITY=$(cat "$TIMESTAMP_FILE")
+            NOW=$(date +%s)
+            IDLE_SECONDS=$((NOW - LAST_ACTIVITY))
+            
+            if [ "$IDLE_SECONDS" -ge "$IDLE_TIMEOUT_SECONDS" ]; then
+                echo "No SSH sessions for ${IDLE_TIMEOUT_MINUTES} minutes. Shutting down..."
+                shutdown -h now
+                exit 0
+            fi
+        fi
+    else
+        # Active sessions exist, reset timestamp
+        update_timestamp
+    fi
+    
+    sleep 60
+done
+IDLESCRIPT
+
+chmod +x /usr/local/bin/devbox-idle-shutdown.sh
+
+# Create systemd service
+cat > /etc/systemd/system/devbox-idle-shutdown.service <<'SERVICEDEF'
+[Unit]
+Description=Devbox Idle Shutdown Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/devbox-idle-shutdown.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICEDEF
+
+echo "Setting up idle shutdown service..."
+systemctl daemon-reload
+systemctl enable devbox-idle-shutdown.service || {
+    echo "WARNING: Failed to enable idle shutdown service"
+}
+systemctl start devbox-idle-shutdown.service || {
+    echo "WARNING: Failed to start idle shutdown service"
+}
+
+echo ""
+echo "=== Devbox Startup Script Completed Successfully ==="
+date
+echo "Log saved to: /var/log/devbox-startup.log"
+EOF
+    echo "$script_file"
+}
+
+ensure_ssh_keys() {
+    # Ensure SSH keys are added to VM metadata
+    SSH_KEY_FILE="${HOME}/.ssh/google_compute_engine.pub"
+    if [[ ! -f "$SSH_KEY_FILE" ]]; then
+        echo "  Generating SSH key..."
+        ssh-keygen -t rsa -f "${HOME}/.ssh/google_compute_engine" -C "$(whoami)" -N "" -q
+    fi
+    
+    SSH_USER=$(whoami)
+    SSH_PUBLIC_KEY=$(cat "$SSH_KEY_FILE")
+    
+    # Check if key already exists in metadata
+    EXISTING_KEYS=$(gcloud compute instances describe "$VM_NAME" \
+        --zone="$ZONE" \
+        --project="$GCP_PROJECT" \
+        --format="get(metadata.items[key=ssh-keys].value)" 2>/dev/null || echo "")
+    
+    if echo "$EXISTING_KEYS" | grep -q "$SSH_PUBLIC_KEY"; then
+        echo "  SSH key already added to VM"
+    else
+        echo "  Adding SSH key to VM metadata..."
+        # Append new key to existing keys
+        if [[ -n "$EXISTING_KEYS" ]]; then
+            NEW_KEYS="${EXISTING_KEYS}"$'\n'"${SSH_USER}:${SSH_PUBLIC_KEY}"
+        else
+            NEW_KEYS="${SSH_USER}:${SSH_PUBLIC_KEY}"
+        fi
+        
+        gcloud compute instances add-metadata "$VM_NAME" \
+            --zone="$ZONE" \
+            --project="$GCP_PROJECT" \
+            --metadata="ssh-keys=${NEW_KEYS}" \
+            --quiet
+        echo "  ✓ SSH key added"
+    fi
+}
+
+ensure_startup_script() {
+    # The startup script is embedded in VM metadata, so we'd need to recreate the VM to update it
+    # For now, we'll just ensure the service is running if VM exists
+    echo "  Ensuring startup script is installed (may require VM restart to update)"
+}
+
+check_and_install_dependencies() {
+    # Only check if VM is running
+    local vm_status=$(get_vm_status)
+    if [[ "$vm_status" != "RUNNING" ]]; then
+        return 0  # Skip check if VM is not running
+    fi
+    
+    # Check if Docker is installed
+    if gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+        --tunnel-through-iap \
+        --command="command -v docker > /dev/null 2>&1" --quiet 2>/dev/null; then
+        echo "  ✓ Dependencies are installed"
+        return 0
+    fi
+    
+    echo "  ⚠ Dependencies (Docker, Git) are not installed"
+    echo "  This is likely because the VM has no internet access (no external IP or Cloud NAT)"
+    echo ""
+    echo "  To install dependencies, you can:"
+    echo "  1. Run the install script via SSH:"
+    echo "     ssh ${VM_NAME}"
+    echo "     curl -fsSL https://raw.githubusercontent.com/your-repo/devbox/main/scripts/install-dependencies.sh | sudo bash"
+    echo ""
+    echo "  2. Or set up Cloud NAT for automatic internet access"
+    return 0
+}
+
+wait_for_vm_ready() {
+    local max_attempts=30
+    local attempt=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --command="echo 'VM is ready'" --quiet &>/dev/null; then
+            echo "  ✓ VM is ready"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        echo "  Waiting... ($attempt/$max_attempts)"
+        sleep 10
+    done
+    
+    echo "  ⚠ VM created but not yet ready. It may take a few more minutes."
+    return 0
+}
+
+create_project_directory() {
+    # Create project directory on VM if it's running, otherwise note it for creation
+    local vm_status=$(get_vm_status)
+    
+    if [[ "$vm_status" == "RUNNING" ]]; then
+        echo "  Creating project directory on VM: ${PROJECT_DIR}"
+        # Fix /mnt/dev ownership if needed, then create project directory
+        gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --command="sudo chown -R \$(whoami):\$(whoami) /mnt/dev 2>/dev/null || true && sudo mkdir -p ${PROJECT_DIR} && sudo chown \$(whoami):\$(whoami) ${PROJECT_DIR}" \
+            --quiet 2>/dev/null || {
+            echo "  ⚠ Could not create directory now (will be created on first connection)"
+            return 0
+        }
+        echo "  ✓ Project directory created"
+    else
+        echo "  Project directory will be created at: ${PROJECT_DIR}"
+        echo "  (Will be created automatically when VM starts)"
+    fi
+}
+
+install_idle_shutdown() {
+    # Idle shutdown is installed via startup script
+    # Just verify it's running if VM is up
+    local vm_status=$(get_vm_status)
+    if [[ "$vm_status" == "RUNNING" ]]; then
+        echo "  Verifying idle shutdown service..."
+        gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --command="systemctl is-active devbox-idle-shutdown.service || echo 'Service not active'" \
+            --quiet 2>/dev/null || true
+    else
+        echo "  Idle shutdown will be installed on next VM start"
+    fi
+}
+
+get_vm_status() {
+    gcloud compute instances describe "$VM_NAME" \
+        --zone="$ZONE" \
+        --project="$GCP_PROJECT" \
+        --format="value(status)" 2>/dev/null || echo "NOT_FOUND"
+}
+
+check_vm_status() {
+    local status=$(get_vm_status)
+    echo "VM Status: ${status}"
+    echo "VM Name: ${VM_NAME}"
+    echo "Zone: ${ZONE}"
+    
+    if [[ "$status" == "RUNNING" ]]; then
+        echo ""
+        echo "Active SSH sessions:"
+        gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --command="who" --quiet 2>/dev/null || echo "  (Unable to check)"
+    fi
+}
+
+start_vm() {
+    local status=$(get_vm_status)
+    if [[ "$status" == "RUNNING" ]]; then
+        echo "VM is already running"
+        return 0
+    fi
+    
+    echo "Starting VM: ${VM_NAME}"
+    gcloud compute instances start "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT"
+    wait_for_vm_ready
+}
+
+stop_vm() {
+    local status=$(get_vm_status)
+    if [[ "$status" != "RUNNING" ]]; then
+        echo "VM is not running"
+        return 0
+    fi
+    
+    echo "Stopping VM: ${VM_NAME}"
+    gcloud compute instances stop "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT"
+}
+
+ssh_to_vm() {
+    local status=$(get_vm_status)
+    if [[ "$status" != "RUNNING" ]]; then
+        echo "VM is not running. Starting it..."
+        start_vm
+    fi
+    
+    gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+        --tunnel-through-iap \
+        "$@"
+}

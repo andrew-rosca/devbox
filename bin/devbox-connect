@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# SSH ProxyCommand wrapper that auto-starts the VM
+
+set -euo pipefail
+
+# Load global config
+GLOBAL_CONFIG_FILE="${HOME}/.devbox/config.json"
+
+if [[ ! -f "$GLOBAL_CONFIG_FILE" ]]; then
+    echo "Error: Devbox not configured. Run 'devbox bootstrap' first." >&2
+    exit 1
+fi
+
+# Parse config (with or without jq)
+if command -v jq &> /dev/null; then
+    GCP_PROJECT=$(jq -r '.gcpProject // empty' "$GLOBAL_CONFIG_FILE")
+    VM_NAME=$(jq -r '.vmName' "$GLOBAL_CONFIG_FILE")
+    ZONE=$(jq -r '.zone' "$GLOBAL_CONFIG_FILE")
+else
+    GCP_PROJECT=$(grep -o '"gcpProject": *"[^"]*"' "$GLOBAL_CONFIG_FILE" | cut -d'"' -f4)
+    VM_NAME=$(grep -o '"vmName": *"[^"]*"' "$GLOBAL_CONFIG_FILE" | cut -d'"' -f4)
+    ZONE=$(grep -o '"zone": *"[^"]*"' "$GLOBAL_CONFIG_FILE" | cut -d'"' -f4)
+fi
+
+# Fallback to gcloud config if not in devbox config (for backward compatibility)
+if [[ -z "$GCP_PROJECT" ]]; then
+    GCP_PROJECT=$(gcloud config get-value project 2>/dev/null)
+fi
+
+if [[ -z "$GCP_PROJECT" ]]; then
+    echo "Error: No GCP project configured. Run 'devbox bootstrap' first." >&2
+    exit 1
+fi
+
+# Verify we're using the project from config (not gcloud default)
+if [[ "${DEBUG_DEVBOX:-}" == "1" ]]; then
+    echo "Devbox-connect: Using project '$GCP_PROJECT', VM '$VM_NAME', Zone '$ZONE'" >&2
+fi
+
+# Check VM status
+VM_STATUS=$(gcloud compute instances describe "$VM_NAME" \
+    --zone="$ZONE" \
+    --project="$GCP_PROJECT" \
+    --format="value(status)" 2>/dev/null || echo "NOT_FOUND")
+
+if [[ "$VM_STATUS" == "NOT_FOUND" ]]; then
+    echo "Error: VM ${VM_NAME} not found. Run 'devbox bootstrap' first." >&2
+    exit 1
+fi
+
+# Start VM if not running
+if [[ "$VM_STATUS" != "RUNNING" ]]; then
+    echo "Starting VM ${VM_NAME}..." >&2
+    gcloud compute instances start "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" --quiet
+    
+    # Wait for VM to be ready
+    echo "Waiting for VM to be ready..." >&2
+    local max_attempts=30
+    local attempt=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if gcloud compute instances describe "$VM_NAME" \
+            --zone="$ZONE" \
+            --project="$GCP_PROJECT" \
+            --format="value(status)" 2>/dev/null | grep -q "RUNNING"; then
+            # Wait a bit more for SSH to be ready
+            sleep 5
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+fi
+
+# Proxy the connection via IAP tunnel
+# Use gcloud compute start-iap-tunnel with --listen-on-stdin
+# This is the correct way to use IAP tunnel as a ProxyCommand
+# Always use port 22 (SSH port on VM), ignore %p from SSH config
+exec gcloud compute start-iap-tunnel "$VM_NAME" 22 \
+    --zone="$ZONE" \
+    --project="$GCP_PROJECT" \
+    --listen-on-stdin \
+    --verbosity=warning

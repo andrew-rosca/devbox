@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Devbox - Simple Elastic GCP Development Machine
+# Main entry point for devbox commands
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEVBOX_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Default values
+DEFAULT_DISK_SIZE_GB=300
+DEFAULT_DISK_TYPE="pd-balanced"
+DEFAULT_IDLE_TIMEOUT_MINUTES=10
+DEFAULT_OS_IMAGE="ubuntu-2204-jammy-v20240111"  # Ubuntu 22.04 LTS
+DEFAULT_MOUNT_POINT="/mnt/dev"
+
+# Get username for default VM/disk naming
+USERNAME="${USER:-$(whoami)}"
+
+# Global config path
+GLOBAL_CONFIG_DIR="${HOME}/.devbox"
+GLOBAL_CONFIG_FILE="${GLOBAL_CONFIG_DIR}/config.json"
+
+# Project config path (relative to current directory)
+PROJECT_CONFIG_FILE=".devbox/config.json"
+
+# Source utility functions
+source "${SCRIPT_DIR}/../scripts/lib/config.sh"
+source "${SCRIPT_DIR}/../scripts/lib/gcp.sh"
+source "${SCRIPT_DIR}/../scripts/lib/vm.sh"
+source "${SCRIPT_DIR}/../scripts/lib/ssh.sh"
+
+usage() {
+    cat <<EOF
+Usage: devbox <command> [options]
+
+Commands:
+    bootstrap    Set up devbox for the current project
+    status       Show VM and disk status
+    start        Manually start the VM
+    stop         Manually stop the VM
+    ssh          Connect to the VM via SSH
+    teardown     Delete VM and persistent disk (destructive!)
+    help         Show this help message
+
+Examples:
+    devbox bootstrap    # Set up devbox for current project
+    devbox status       # Check if VM is running
+    devbox ssh          # Connect to VM
+EOF
+}
+
+cmd_bootstrap() {
+    echo "🚀 Devbox Bootstrap"
+    echo "==================="
+    echo ""
+
+    # 1. Read configuration files first (needed for GCP_PROJECT)
+    echo "📖 Reading configuration..."
+    load_global_config
+    load_project_config
+    echo "✓ Configuration loaded"
+    echo ""
+
+    # 2. Validate environment (uses GCP_PROJECT from config)
+    echo "📋 Validating environment..."
+    validate_environment || exit 1
+    echo "✓ Environment validated"
+    echo ""
+
+    # 3. Ensure shared persistent disk exists
+    echo "💾 Ensuring persistent disk exists..."
+    ensure_disk_exists || exit 1
+    echo "✓ Disk ready: ${DISK_NAME}"
+    echo ""
+
+    # 4. Ensure shared VM exists
+    echo "🖥️  Ensuring VM exists..."
+    ensure_vm_exists || exit 1
+    echo "✓ VM ready: ${VM_NAME}"
+    echo ""
+
+    # 5. Create project directory on persistent disk
+    echo "📁 Creating project directory..."
+    create_project_directory || exit 1
+    echo "✓ Project directory ready: ${PROJECT_DIR}"
+    echo ""
+
+    # 6. Install idle shutdown on VM (if needed)
+    echo "⏰ Ensuring idle shutdown service is installed..."
+    install_idle_shutdown || exit 1
+    echo "✓ Idle shutdown service ready"
+    echo ""
+
+    # 7. Configure local SSH auto-start
+    echo "🔌 Configuring SSH..."
+    configure_ssh || exit 1
+    echo "✓ SSH configured"
+    echo ""
+
+    echo ""
+    echo "✅ Bootstrap complete!"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Open VS Code / Cursor"
+    echo "  2. Connect to Remote SSH: ${VM_NAME}"
+    echo "  3. Open folder: ${PROJECT_DIR}"
+    echo ""
+}
+
+cmd_status() {
+    load_global_config
+    check_vm_status
+}
+
+cmd_start() {
+    load_global_config
+    start_vm
+}
+
+cmd_stop() {
+    load_global_config
+    stop_vm
+}
+
+cmd_ssh() {
+    load_global_config
+    ssh_to_vm "$@"
+}
+
+cmd_teardown() {
+    load_global_config
+    
+    # Confirm before proceeding
+    echo ""
+    echo "⚠️  ⚠️  ⚠️   DESTRUCTIVE OPERATION   ⚠️  ⚠️  ⚠️"
+    echo ""
+    echo "This will PERMANENTLY DELETE:"
+    echo "   - VM: ${VM_NAME}"
+    echo "   - Persistent disk: ${DISK_NAME}"
+    echo "   - ALL data on the persistent disk"
+    echo ""
+    echo "This action CANNOT be undone!"
+    echo ""
+    read -p "Type 'DELETE' to confirm teardown: " confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        echo ""
+        echo "Teardown cancelled. No resources were deleted."
+        return 0
+    fi
+    
+    echo ""
+    echo "Deleting VM: ${VM_NAME}"
+    if gcloud compute instances delete "$VM_NAME" \
+        --zone="$ZONE" \
+        --project="$GCP_PROJECT" \
+        --delete-disks=boot \
+        --quiet; then
+        echo "✓ VM deleted"
+    else
+        echo "⚠️  VM deletion failed or VM does not exist"
+    fi
+    
+    echo ""
+    echo "Deleting persistent disk: ${DISK_NAME}"
+    if gcloud compute disks delete "$DISK_NAME" \
+        --zone="$ZONE" \
+        --project="$GCP_PROJECT" \
+        --quiet; then
+        echo "✓ Persistent disk deleted"
+    else
+        echo "⚠️  Disk deletion failed or disk does not exist"
+    fi
+    
+    echo ""
+    echo "✓ All resources deleted"
+}
+
+# Main command dispatcher
+case "${1:-help}" in
+    bootstrap)
+        cmd_bootstrap
+        ;;
+    status)
+        cmd_status
+        ;;
+    start)
+        cmd_start
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    ssh)
+        shift
+        cmd_ssh "$@"
+        ;;
+    teardown)
+        cmd_teardown
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo ""
+        usage
+        exit 1
+        ;;
+esac

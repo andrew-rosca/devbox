@@ -58,6 +58,7 @@ ensure_vm_exists() {
     
     # Create VM with external IP for internet access (still using IAP for SSH)
     # The external IP is needed for outbound internet access (apt-get, Docker downloads, etc.)
+    # Disable automatic restart so VM stays stopped when idle shutdown triggers
     gcloud compute instances create "$VM_NAME" \
         --machine-type="$MACHINE_TYPE" \
         --zone="$ZONE" \
@@ -69,6 +70,7 @@ ensure_vm_exists() {
         --metadata-from-file="startup-script=${STARTUP_SCRIPT}" \
         --metadata="ssh-keys=${SSH_KEYS_METADATA}" \
         --tags="devbox" \
+        --no-restart-on-failure \
         --project="$GCP_PROJECT" \
         --quiet
 
@@ -279,35 +281,127 @@ cat > /usr/local/bin/devbox-idle-shutdown.sh <<'IDLESCRIPT'
 IDLE_TIMEOUT_MINUTES=10
 IDLE_TIMEOUT_SECONDS=$((IDLE_TIMEOUT_MINUTES * 60))
 TIMESTAMP_FILE="/tmp/devbox-last-ssh-activity"
+LOG_FILE="/var/log/devbox-idle-shutdown.log"
+
+# Logging function
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
 
 # Update timestamp
 update_timestamp() {
     echo $(date +%s) > "$TIMESTAMP_FILE"
 }
 
+# Check for active SSH sessions - use multiple methods for reliability
+check_active_sessions() {
+    local sessions=0
+    
+    # Method 1: Check for active pseudo-terminals (SSH sessions)
+    if command -v who >/dev/null 2>&1; then
+        sessions=$(who | grep -c "pts/" 2>/dev/null || echo "0")
+    fi
+    
+    # Method 2: Check for active SSH connections on port 22
+    if [ "$sessions" -eq 0 ] && command -v ss >/dev/null 2>&1; then
+        # Check for established SSH connections (excluding our own check)
+        local ssh_connections=$(ss -tn state established '( dport = :22 )' 2>/dev/null | wc -l)
+        if [ "$ssh_connections" -gt 0 ]; then
+            sessions=1
+        fi
+    fi
+    
+    # Method 3: Check for active SSH processes (as fallback)
+    if [ "$sessions" -eq 0 ] && command -v pgrep >/dev/null 2>&1; then
+        # Count SSH processes that are serving connections (not just listening)
+        local sshd_count=$(pgrep -f "sshd:.*@pts" 2>/dev/null | wc -l)
+        if [ "$sshd_count" -gt 0 ]; then
+            sessions=$sshd_count
+        fi
+    fi
+    
+    echo "$sessions"
+}
+
 # Initialize
 update_timestamp
+log_message "Idle shutdown service started (timeout: ${IDLE_TIMEOUT_MINUTES} minutes)"
+LAST_SESSION_COUNT=0
 
 while true; do
-    # Check for active SSH sessions (pts/* are SSH pseudo-terminals)
-    ACTIVE_SESSIONS=$(who | grep -c "pts/" || echo "0")
+    # Check for active SSH sessions
+    ACTIVE_SESSIONS=$(check_active_sessions)
     
-    if [ "$ACTIVE_SESSIONS" -eq 0 ]; then
-        # No active sessions, check idle time
+    if [ "$ACTIVE_SESSIONS" -gt 0 ]; then
+        # Active sessions exist
+        if [ "$LAST_SESSION_COUNT" -eq 0 ]; then
+            # Just transitioned from no sessions to having sessions
+            log_message "SSH session detected (count: $ACTIVE_SESSIONS)"
+        fi
+        update_timestamp
+        LAST_SESSION_COUNT=$ACTIVE_SESSIONS
+    else
+        # No active sessions
+        if [ "$LAST_SESSION_COUNT" -gt 0 ]; then
+            # Just transitioned from having sessions to no sessions
+            log_message "All SSH sessions disconnected. Starting idle timer."
+            update_timestamp  # Set timestamp to now when sessions disconnect
+        fi
+        
+        # Check idle time since last activity
         if [ -f "$TIMESTAMP_FILE" ]; then
             LAST_ACTIVITY=$(cat "$TIMESTAMP_FILE")
             NOW=$(date +%s)
             IDLE_SECONDS=$((NOW - LAST_ACTIVITY))
+            IDLE_MINUTES=$((IDLE_SECONDS / 60))
+            
+            # Log every 5 minutes when idle
+            if [ $((IDLE_SECONDS % 300)) -lt 60 ]; then
+                log_message "Idle for ${IDLE_MINUTES} minutes (${IDLE_TIMEOUT_MINUTES} minute timeout)"
+            fi
             
             if [ "$IDLE_SECONDS" -ge "$IDLE_TIMEOUT_SECONDS" ]; then
-                echo "No SSH sessions for ${IDLE_TIMEOUT_MINUTES} minutes. Shutting down..."
-                shutdown -h now
+                log_message "Idle timeout reached (${IDLE_MINUTES} minutes). Stopping VM via GCP API..."
+                
+                # Get VM name, zone, and project from metadata
+                VM_NAME=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)
+                ZONE=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone | sed 's/.*\///')
+                PROJECT=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id)
+                
+                # Get access token for GCP API
+                TOKEN_RESPONSE=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token)
+                ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token":"[^"]*"' | sed 's/"access_token":"\([^"]*\)"/\1/')
+                
+                # Stop the VM using GCP REST API
+                if [ -n "$ACCESS_TOKEN" ] && [ -n "$VM_NAME" ] && [ -n "$ZONE" ] && [ -n "$PROJECT" ]; then
+                    log_message "Calling GCP API to stop VM: $VM_NAME in zone $ZONE"
+                    RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
+                        -H "Authorization: Bearer $ACCESS_TOKEN" \
+                        "https://compute.googleapis.com/compute/v1/projects/$PROJECT/zones/$ZONE/instances/$VM_NAME/stop")
+                    
+                    HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
+                    RESPONSE_BODY=$(echo "$RESPONSE" | sed '/HTTP_CODE:/d')
+                    
+                    if [ "$HTTP_CODE" = "200" ] || echo "$RESPONSE_BODY" | grep -q '"status":"DONE"'; then
+                        log_message "VM stop request sent successfully (HTTP $HTTP_CODE)"
+                        # Wait a moment for the stop to initiate, then exit
+                        sleep 2
+                        exit 0
+                    else
+                        log_message "API call failed (HTTP $HTTP_CODE): $RESPONSE_BODY"
+                        log_message "Falling back to shutdown command"
+                        # Use systemctl poweroff which works better in systemd context
+                        systemctl poweroff || shutdown -h now
+                    fi
+                else
+                    log_message "Failed to get metadata (VM_NAME=$VM_NAME, ZONE=$ZONE, PROJECT=$PROJECT, TOKEN=${ACCESS_TOKEN:0:20}...)"
+                    log_message "Using shutdown command"
+                    systemctl poweroff || shutdown -h now
+                fi
                 exit 0
             fi
         fi
-    else
-        # Active sessions exist, reset timestamp
-        update_timestamp
+        LAST_SESSION_COUNT=0
     fi
     
     sleep 60
@@ -527,7 +621,17 @@ ssh_to_vm() {
         start_vm
     fi
     
-    gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
-        --tunnel-through-iap \
-        "$@"
+    # If arguments are provided, treat them as a command to run
+    # Otherwise, open an interactive SSH session
+    if [ $# -gt 0 ]; then
+        # Join all arguments into a single command string
+        local command="$*"
+        gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+            --tunnel-through-iap \
+            --command="$command"
+    else
+        # No arguments, open interactive session
+        gcloud compute ssh "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" \
+            --tunnel-through-iap
+    fi
 }

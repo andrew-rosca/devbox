@@ -265,11 +265,36 @@ devbox start
 gcloud compute instances describe devbox-username --zone=us-central1-a
 ```
 
-### SSH connection fails
+### SSH connection fails / VS Code times out
 
-```bash
-# Test SSH directly
-devbox ssh
+If VS Code Remote SSH times out when connecting:
+
+1. **Check your SSH config has timeout settings:**
+   ```bash
+   cat ~/.ssh/config | grep -A 10 "Host devbox-1"
+   ```
+   Should include:
+   ```
+   ConnectTimeout 180
+   ServerAliveInterval 60
+   ServerAliveCountMax 3
+   TCPKeepAlive yes
+   ```
+
+2. **Add VS Code Remote SSH timeout settings:**
+   Open VS Code settings (Cmd+,) and add:
+   ```json
+   {
+     "remote.SSH.connectTimeout": 180,
+     "remote.SSH.serverInstallTimeout": 180
+   }
+   ```
+   Or edit `~/.vscode/settings.json` (or `~/Library/Application Support/Code/User/settings.json` on macOS)
+
+3. **Test SSH directly:**
+   ```bash
+   devbox ssh
+   ```
 
 # Check SSH config
 cat ~/.ssh/config | grep devbox

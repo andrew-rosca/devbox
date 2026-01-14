@@ -53,23 +53,44 @@ if [[ "$VM_STATUS" != "RUNNING" ]]; then
     echo "Starting VM ${VM_NAME}..." >&2
     gcloud compute instances start "$VM_NAME" --zone="$ZONE" --project="$GCP_PROJECT" --quiet
     
-    # Wait for VM to be ready
-    echo "Waiting for VM to be ready..." >&2
-    local max_attempts=30
-    local attempt=0
+    # Wait for VM to be RUNNING (don't test SSH here - that blocks ProxyCommand)
+    # The actual SSH connection will handle SSH readiness
+    echo "Waiting for VM to start (this may take 30-60 seconds)..." >&2
+    max_attempts=60  # 2 minutes max wait
+    attempt=0
     
     while [ $attempt -lt $max_attempts ]; do
-        if gcloud compute instances describe "$VM_NAME" \
+        CURRENT_STATUS=$(gcloud compute instances describe "$VM_NAME" \
             --zone="$ZONE" \
             --project="$GCP_PROJECT" \
-            --format="value(status)" 2>/dev/null | grep -q "RUNNING"; then
-            # Wait a bit more for SSH to be ready
-            sleep 5
+            --format="value(status)" 2>/dev/null || echo "UNKNOWN")
+        
+        if [[ "$CURRENT_STATUS" == "RUNNING" ]]; then
+            # VM is running, wait for SSH service to fully start
+            # SSH service typically takes 15-30 seconds after VM status is RUNNING
+            echo "VM is running, waiting for SSH service (this may take 20-40 seconds)..." >&2
+            # Wait 30 seconds for SSH to be ready, with progress updates
+            for ssh_wait in $(seq 1 10); do
+                sleep 3
+                if [ $((ssh_wait % 3)) -eq 0 ]; then
+                    echo "Still waiting for SSH service... ($((ssh_wait * 3))s)" >&2
+                fi
+            done
+            echo "SSH service should be ready, establishing connection..." >&2
             break
         fi
+        
         attempt=$((attempt + 1))
+        if [ $((attempt % 5)) -eq 0 ]; then
+            echo "Still waiting for VM to start... ($attempt/$max_attempts)" >&2
+        fi
         sleep 2
     done
+    
+    if [ $attempt -ge $max_attempts ]; then
+        echo "Error: VM failed to start within timeout" >&2
+        exit 1
+    fi
 fi
 
 # Proxy the connection via IAP tunnel

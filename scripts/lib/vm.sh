@@ -59,6 +59,7 @@ ensure_vm_exists() {
     # Create VM with external IP for internet access (still using IAP for SSH)
     # The external IP is needed for outbound internet access (apt-get, Docker downloads, etc.)
     # Disable automatic restart so VM stays stopped when idle shutdown triggers
+    # Add compute scope so the VM can stop itself via API
     gcloud compute instances create "$VM_NAME" \
         --machine-type="$MACHINE_TYPE" \
         --zone="$ZONE" \
@@ -71,6 +72,7 @@ ensure_vm_exists() {
         --metadata="ssh-keys=${SSH_KEYS_METADATA}" \
         --tags="devbox" \
         --no-restart-on-failure \
+        --scopes="https://www.googleapis.com/auth/compute" \
         --project="$GCP_PROJECT" \
         --quiet
 
@@ -295,32 +297,37 @@ update_timestamp() {
 
 # Check for active SSH sessions - use multiple methods for reliability
 check_active_sessions() {
-    local sessions=0
+    sessions=0
     
-    # Method 1: Check for active pseudo-terminals (SSH sessions)
+    # Method 1: Check for active pseudo-terminals (SSH sessions) - PRIMARY METHOD
+    # This is the most reliable - actual user sessions show up in 'who'
     if command -v who >/dev/null 2>&1; then
-        sessions=$(who | grep -c "pts/" 2>/dev/null || echo "0")
-    fi
-    
-    # Method 2: Check for active SSH connections on port 22
-    if [ "$sessions" -eq 0 ] && command -v ss >/dev/null 2>&1; then
-        # Check for established SSH connections (excluding our own check)
-        local ssh_connections=$(ss -tn state established '( dport = :22 )' 2>/dev/null | wc -l)
-        if [ "$ssh_connections" -gt 0 ]; then
-            sessions=1
+        session_count=$(who | grep -c "pts/" 2>/dev/null || echo "0")
+        # Ensure it's a number, default to 0 if not, and strip whitespace
+        session_count=$(echo "$session_count" | tr -d '[:space:]')
+        if [ -z "$session_count" ] || ! [ "$session_count" -eq "$session_count" ] 2>/dev/null; then
+            session_count=0
         fi
+        sessions=$session_count
     fi
     
-    # Method 3: Check for active SSH processes (as fallback)
-    if [ "$sessions" -eq 0 ] && command -v pgrep >/dev/null 2>&1; then
-        # Count SSH processes that are serving connections (not just listening)
-        local sshd_count=$(pgrep -f "sshd:.*@pts" 2>/dev/null | wc -l)
-        if [ "$sshd_count" -gt 0 ]; then
+    # Only use fallback methods if 'who' shows no sessions
+    # (IAP tunnel connections don't show up in 'who', so we need to be careful)
+    if [ $sessions -eq 0 ] && command -v pgrep >/dev/null 2>&1; then
+        # Check for SSH processes serving user sessions (sshd: user@pts)
+        # This is more reliable than checking network connections
+        sshd_count=$(pgrep -f "sshd:.*@pts" 2>/dev/null | wc -l)
+        sshd_count=$(echo "$sshd_count" | tr -d '[:space:]')
+        if [ -z "$sshd_count" ] || ! [ "$sshd_count" -eq "$sshd_count" ] 2>/dev/null; then
+            sshd_count=0
+        fi
+        if [ $sshd_count -gt 0 ]; then
             sessions=$sshd_count
         fi
     fi
     
-    echo "$sessions"
+    # Ensure we return a clean integer (no whitespace)
+    echo $sessions
 }
 
 # Initialize
@@ -331,10 +338,20 @@ LAST_SESSION_COUNT=0
 while true; do
     # Check for active SSH sessions
     ACTIVE_SESSIONS=$(check_active_sessions)
+    # Ensure ACTIVE_SESSIONS is a clean integer (handle empty/whitespace)
+    ACTIVE_SESSIONS=$(echo "$ACTIVE_SESSIONS" | tr -d '[:space:]')
+    if [ -z "$ACTIVE_SESSIONS" ] || ! [ "$ACTIVE_SESSIONS" -eq "$ACTIVE_SESSIONS" ] 2>/dev/null; then
+        ACTIVE_SESSIONS=0
+    fi
     
-    if [ "$ACTIVE_SESSIONS" -gt 0 ]; then
+    # Debug logging every 5 minutes
+    if [ $(($(date +%s) % 300)) -lt 60 ]; then
+        log_message "Debug: ACTIVE_SESSIONS=$ACTIVE_SESSIONS, LAST_SESSION_COUNT=$LAST_SESSION_COUNT"
+    fi
+    
+    if [ $ACTIVE_SESSIONS -gt 0 ]; then
         # Active sessions exist
-        if [ "$LAST_SESSION_COUNT" -eq 0 ]; then
+        if [ $LAST_SESSION_COUNT -eq 0 ]; then
             # Just transitioned from no sessions to having sessions
             log_message "SSH session detected (count: $ACTIVE_SESSIONS)"
         fi
@@ -342,7 +359,7 @@ while true; do
         LAST_SESSION_COUNT=$ACTIVE_SESSIONS
     else
         # No active sessions
-        if [ "$LAST_SESSION_COUNT" -gt 0 ]; then
+        if [ $LAST_SESSION_COUNT -gt 0 ]; then
             # Just transitioned from having sessions to no sessions
             log_message "All SSH sessions disconnected. Starting idle timer."
             update_timestamp  # Set timestamp to now when sessions disconnect
@@ -361,20 +378,31 @@ while true; do
             fi
             
             if [ "$IDLE_SECONDS" -ge "$IDLE_TIMEOUT_SECONDS" ]; then
-                log_message "Idle timeout reached (${IDLE_MINUTES} minutes). Stopping VM via GCP API..."
+                log_message "Idle timeout reached (${IDLE_MINUTES} minutes). Stopping VM..."
                 
                 # Get VM name, zone, and project from metadata
                 VM_NAME=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)
                 ZONE=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone | sed 's/.*\///')
                 PROJECT=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id)
                 
-                # Get access token for GCP API
-                TOKEN_RESPONSE=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token)
-                ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token":"[^"]*"' | sed 's/"access_token":"\([^"]*\)"/\1/')
+                # Try using gcloud first (simpler and more reliable)
+                if command -v gcloud >/dev/null 2>&1 && [ -n "$VM_NAME" ] && [ -n "$ZONE" ] && [ -n "$PROJECT" ]; then
+                    log_message "Stopping VM using gcloud: $VM_NAME in zone $ZONE"
+                    if gcloud compute instances stop "$VM_NAME" --zone="$ZONE" --project="$PROJECT" --quiet 2>&1 | tee -a "$LOG_FILE"; then
+                        log_message "VM stop command sent successfully via gcloud"
+                        sleep 2
+                        exit 0
+                    else
+                        log_message "gcloud stop command failed, trying REST API..."
+                    fi
+                fi
                 
-                # Stop the VM using GCP REST API
+                # Fallback to REST API
+                TOKEN_RESPONSE=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token)
+                ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+                
                 if [ -n "$ACCESS_TOKEN" ] && [ -n "$VM_NAME" ] && [ -n "$ZONE" ] && [ -n "$PROJECT" ]; then
-                    log_message "Calling GCP API to stop VM: $VM_NAME in zone $ZONE"
+                    log_message "Stopping VM using REST API: $VM_NAME in zone $ZONE"
                     RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
                         -H "Authorization: Bearer $ACCESS_TOKEN" \
                         "https://compute.googleapis.com/compute/v1/projects/$PROJECT/zones/$ZONE/instances/$VM_NAME/stop")
@@ -384,18 +412,15 @@ while true; do
                     
                     if [ "$HTTP_CODE" = "200" ] || echo "$RESPONSE_BODY" | grep -q '"status":"DONE"'; then
                         log_message "VM stop request sent successfully (HTTP $HTTP_CODE)"
-                        # Wait a moment for the stop to initiate, then exit
                         sleep 2
                         exit 0
                     else
                         log_message "API call failed (HTTP $HTTP_CODE): $RESPONSE_BODY"
-                        log_message "Falling back to shutdown command"
-                        # Use systemctl poweroff which works better in systemd context
+                        log_message "Falling back to systemctl poweroff"
                         systemctl poweroff || shutdown -h now
                     fi
                 else
-                    log_message "Failed to get metadata (VM_NAME=$VM_NAME, ZONE=$ZONE, PROJECT=$PROJECT, TOKEN=${ACCESS_TOKEN:0:20}...)"
-                    log_message "Using shutdown command"
+                    log_message "Failed to get metadata or access token, using systemctl poweroff"
                     systemctl poweroff || shutdown -h now
                 fi
                 exit 0
